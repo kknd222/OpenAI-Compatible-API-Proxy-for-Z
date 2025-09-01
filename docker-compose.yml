@@ -1,0 +1,15 @@
+version: '3.8'
+
+services:
+  z2api:
+    image: kknd22/z2api:latest
+    container_name: z2api_proxy
+    ports:
+      - "8080:8080"
+    environment:
+      # - UPSTREAM_TOKEN=your_z.ai_token_here # 必需：请替换为你的 Z.ai 访问令牌
+      - DEFAULT_KEY=sk-your-key             # 可选：客户端访问此代理服务所需的API Key
+      - MODEL_MAP="GLM-4.5:0727-360B-API,GLM-4.5V:glm-4.5v" # 可选：配置模型列表 "显示名称:上游ID,..."
+      - PORT=8080                           # 服务监听端口
+      - DEBUG_MODE=true                     # 开启Debug日志
+    restart: unless-stopped
