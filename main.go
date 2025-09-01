@@ -16,13 +16,13 @@ import (
 
 // 配置变量（从环境变量读取）
 var (
-	UPSTREAM_URL     string
-	DEFAULT_KEY      string
-	UPSTREAM_TOKEN   string
-	MODEL_NAME       string
-	PORT             string
-	DEBUG_MODE       bool
-	DEFAULT_STREAM   bool
+	UPSTREAM_URL   string
+	DEFAULT_KEY    string
+	UPSTREAM_TOKEN string
+	MODEL_MAP      map[string]string
+	PORT           string
+	DEBUG_MODE     bool
+	DEFAULT_STREAM bool
 )
 
 // 思考内容处理策略
@@ -48,14 +48,27 @@ func initConfig() {
 	UPSTREAM_URL = getEnv("UPSTREAM_URL", "https://chat.z.ai/api/chat/completions")
 	DEFAULT_KEY = getEnv("DEFAULT_KEY", "sk-your-key")
 	UPSTREAM_TOKEN = getEnv("UPSTREAM_TOKEN", "eyJhbGciOiJFUzI1NiIsInR5cCI6IkpXVCJ9.eyJpZCI6IjMxNmJjYjQ4LWZmMmYtNGExNS04NTNkLWYyYTI5YjY3ZmYwZiIsImVtYWlsIjoiR3Vlc3QtMTc1NTg0ODU4ODc4OEBndWVzdC5jb20ifQ.PktllDySS3trlyuFpTeIZf-7hl8Qu1qYF3BxjgIul0BrNux2nX9hVzIjthLXKMWAf9V0qM8Vm_iyDqkjPGsaiQ")
-	MODEL_NAME = getEnv("MODEL_NAME", "GLM-4.5")
 	PORT = getEnv("PORT", "8080")
-	
+
+	modelMapStr := getEnv("MODEL_MAP", "GLM-4.5:0727-360B-API,GLM-4.5V:glm-4.5v")
+	MODEL_MAP = make(map[string]string)
+	pairs := strings.Split(modelMapStr, ",")
+	for _, pair := range pairs {
+		kv := strings.SplitN(pair, ":", 2)
+		if len(kv) == 2 {
+			key := strings.TrimSpace(kv[0])
+			value := strings.TrimSpace(kv[1])
+			if key != "" && value != "" {
+				MODEL_MAP[key] = value
+			}
+		}
+	}
+
 	// 处理PORT格式，确保有冒号前缀
 	if !strings.HasPrefix(PORT, ":") {
 		PORT = ":" + PORT
 	}
-	
+
 	DEBUG_MODE = getEnv("DEBUG_MODE", "true") == "true"
 	DEFAULT_STREAM = getEnv("DEFAULT_STREAM", "true") == "true"
 }
@@ -209,16 +222,24 @@ func getAnonymousToken() (string, error) {
 	return body.Token, nil
 }
 
+func getModelNames() []string {
+	names := make([]string, 0, len(MODEL_MAP))
+	for name := range MODEL_MAP {
+		names = append(names, name)
+	}
+	return names
+}
+
 func main() {
 	// 初始化配置
 	initConfig()
-	
+
 	http.HandleFunc("/v1/models", handleModels)
 	http.HandleFunc("/v1/chat/completions", handleChatCompletions)
 	http.HandleFunc("/", handleOptions)
 
 	log.Printf("OpenAI兼容API服务器启动在端口%s", PORT)
-	log.Printf("模型: %s", MODEL_NAME)
+	log.Printf("可用模型: %v", getModelNames())
 	log.Printf("上游: %s", UPSTREAM_URL)
 	log.Printf("Debug模式: %v", DEBUG_MODE)
 	log.Printf("默认流式响应: %v", DEFAULT_STREAM)
@@ -248,16 +269,19 @@ func handleModels(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	models := make([]Model, 0, len(MODEL_MAP))
+	for modelName := range MODEL_MAP {
+		models = append(models, Model{
+			ID:      modelName,
+			Object:  "model",
+			Created: time.Now().Unix(),
+			OwnedBy: "z.ai",
+		})
+	}
+
 	response := ModelsResponse{
 		Object: "list",
-		Data: []Model{
-			{
-				ID:      MODEL_NAME,
-				Object:  "model",
-				Created: time.Now().Unix(),
-				OwnedBy: "z.ai",
-			},
-		},
+		Data:   models,
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -312,7 +336,15 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		debugLog("客户端未指定stream参数，使用默认值: %v", DEFAULT_STREAM)
 	}
 
-	debugLog("请求解析成功 - 模型: %s, 流式: %v, 消息数: %d", req.Model, req.Stream, len(req.Messages))
+	// New model lookup logic
+	upstreamModelID, ok := MODEL_MAP[req.Model]
+	if !ok {
+		debugLog("不支持的模型: %s", req.Model)
+		http.Error(w, fmt.Sprintf("Unsupported model: %s. Available models: %v", req.Model, getModelNames()), http.StatusBadRequest)
+		return
+	}
+
+	debugLog("请求解析成功 - display_model: %s, upstream_model: %s, 流式: %v, 消息数: %d", req.Model, upstreamModelID, req.Stream, len(req.Messages))
 
 	// 生成会话相关ID
 	chatID := fmt.Sprintf("%d-%d", time.Now().UnixNano(), time.Now().Unix())
@@ -323,7 +355,7 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		Stream:   true, // 总是使用流式从上游获取
 		ChatID:   chatID,
 		ID:       msgID,
-		Model:    "0727-360B-API", // 上游实际模型ID
+		Model:    upstreamModelID,
 		Messages: req.Messages,
 		Params:   map[string]interface{}{},
 		Features: map[string]interface{}{
@@ -338,7 +370,7 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 			ID      string `json:"id"`
 			Name    string `json:"name"`
 			OwnedBy string `json:"owned_by"`
-		}{ID: "0727-360B-API", Name: "GLM-4.5", OwnedBy: "openai"},
+		}{ID: upstreamModelID, Name: req.Model, OwnedBy: "openai"},
 		ToolServers: []string{},
 		Variables: map[string]string{
 			"{{USER_NAME}}":        "User",
@@ -365,9 +397,9 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	// 调用上游API
 	if req.Stream {
-		handleStreamResponseWithIDs(w, upstreamReq, chatID, authToken)
+		handleStreamResponseWithIDs(w, upstreamReq, chatID, authToken, req.Model)
 	} else {
-		handleNonStreamResponseWithIDs(w, upstreamReq, chatID, authToken)
+		handleNonStreamResponseWithIDs(w, upstreamReq, chatID, authToken, req.Model)
 	}
 }
 
@@ -410,7 +442,7 @@ func callUpstreamWithHeaders(upstreamReq UpstreamRequest, refererChatID string, 
 	return resp, nil
 }
 
-func handleStreamResponseWithIDs(w http.ResponseWriter, upstreamReq UpstreamRequest, chatID string, authToken string) {
+func handleStreamResponseWithIDs(w http.ResponseWriter, upstreamReq UpstreamRequest, chatID string, authToken string, displayModel string) {
 	debugLog("开始处理流式响应 (chat_id=%s)", chatID)
 
 	resp, err := callUpstreamWithHeaders(upstreamReq, chatID, authToken)
@@ -471,7 +503,7 @@ func handleStreamResponseWithIDs(w http.ResponseWriter, upstreamReq UpstreamRequ
 		ID:      fmt.Sprintf("chatcmpl-%d", time.Now().Unix()),
 		Object:  "chat.completion.chunk",
 		Created: time.Now().Unix(),
-		Model:   MODEL_NAME,
+		Model:   displayModel,
 		Choices: []Choice{
 			{
 				Index: 0,
@@ -523,7 +555,7 @@ func handleStreamResponseWithIDs(w http.ResponseWriter, upstreamReq UpstreamRequ
 				ID:      fmt.Sprintf("chatcmpl-%d", time.Now().Unix()),
 				Object:  "chat.completion.chunk",
 				Created: time.Now().Unix(),
-				Model:   MODEL_NAME,
+				Model:   displayModel,
 				Choices: []Choice{{Index: 0, Delta: Delta{}, FinishReason: "stop"}},
 			}
 			writeSSEChunk(w, endChunk)
@@ -547,7 +579,7 @@ func handleStreamResponseWithIDs(w http.ResponseWriter, upstreamReq UpstreamRequ
 					ID:      fmt.Sprintf("chatcmpl-%d", time.Now().Unix()),
 					Object:  "chat.completion.chunk",
 					Created: time.Now().Unix(),
-					Model:   MODEL_NAME,
+					Model:   displayModel,
 					Choices: []Choice{
 						{
 							Index: 0,
@@ -568,7 +600,7 @@ func handleStreamResponseWithIDs(w http.ResponseWriter, upstreamReq UpstreamRequ
 				ID:      fmt.Sprintf("chatcmpl-%d", time.Now().Unix()),
 				Object:  "chat.completion.chunk",
 				Created: time.Now().Unix(),
-				Model:   MODEL_NAME,
+				Model:   displayModel,
 				Choices: []Choice{
 					{
 						Index:        0,
@@ -598,7 +630,7 @@ func writeSSEChunk(w http.ResponseWriter, chunk OpenAIResponse) {
 	fmt.Fprintf(w, "data: %s\n\n", data)
 }
 
-func handleNonStreamResponseWithIDs(w http.ResponseWriter, upstreamReq UpstreamRequest, chatID string, authToken string) {
+func handleNonStreamResponseWithIDs(w http.ResponseWriter, upstreamReq UpstreamRequest, chatID string, authToken string, displayModel string) {
 	debugLog("开始处理非流式响应 (chat_id=%s)", chatID)
 
 	resp, err := callUpstreamWithHeaders(upstreamReq, chatID, authToken)
@@ -683,7 +715,7 @@ func handleNonStreamResponseWithIDs(w http.ResponseWriter, upstreamReq UpstreamR
 		ID:      fmt.Sprintf("chatcmpl-%d", time.Now().Unix()),
 		Object:  "chat.completion",
 		Created: time.Now().Unix(),
-		Model:   MODEL_NAME,
+		Model:   displayModel,
 		Choices: []Choice{
 			{
 				Index: 0,
