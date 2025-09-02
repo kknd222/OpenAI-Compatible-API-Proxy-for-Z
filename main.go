@@ -91,15 +91,25 @@ type OpenAIRequest struct {
 }
 
 type Message struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
+	Role    string      `json:"role"`
+	Content interface{} `json:"content"` // Can be string or []ContentPart
+}
+
+type ContentPart struct {
+	Type     string   `json:"type"`
+	Text     string   `json:"text,omitempty"`
+	ImageURL ImageURL `json:"image_url,omitempty"`
+}
+
+type ImageURL struct {
+	URL string `json:"url"`
 }
 
 // 上游请求结构
 type UpstreamRequest struct {
 	Stream          bool                   `json:"stream"`
 	Model           string                 `json:"model"`
-	Messages        []Message              `json:"messages"`
+	Messages        []UpstreamMessage      `json:"messages"`
 	Params          map[string]interface{} `json:"params"`
 	Features        map[string]interface{} `json:"features"`
 	BackgroundTasks map[string]bool        `json:"background_tasks,omitempty"`
@@ -113,6 +123,33 @@ type UpstreamRequest struct {
 	} `json:"model_item,omitempty"`
 	ToolServers []string          `json:"tool_servers,omitempty"`
 	Variables   map[string]string `json:"variables,omitempty"`
+}
+
+type UpstreamMessage struct {
+	Role    string         `json:"role"`
+	Content string         `json:"content"`
+	Files   []UpstreamFile `json:"files,omitempty"`
+}
+
+// A more faithful representation of the Z.ai file structure for our best-effort attempt.
+type UpstreamFile struct {
+	Type   string            `json:"type"`   // "image"
+	File   UpstreamFileInner `json:"file"`
+	Name   string            `json:"name"`   // e.g., "pasted_image.png"
+	Size   int               `json:"size"`   // size in bytes
+	Status string            `json:"status"` // "uploaded" or "pasted"
+}
+
+type UpstreamFileInner struct {
+	Filename string           `json:"filename"`
+	Meta     UpstreamFileMeta `json:"meta"`
+}
+
+type UpstreamFileMeta struct {
+	Name        string `json:"name"`
+	ContentType string `json:"content_type"` // e.g., "image/png"
+	Size        int    `json:"size"`
+	Data        string `json:"data"` // The base64 data will go here.
 }
 
 // OpenAI 响应结构
@@ -288,6 +325,85 @@ func handleModels(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(response)
 }
 
+func translateMessages(reqMessages []Message) ([]UpstreamMessage, error) {
+	var upstreamMessages []UpstreamMessage
+	for _, msg := range reqMessages {
+		switch content := msg.Content.(type) {
+		case string:
+			// Handle simple text message
+			upstreamMessages = append(upstreamMessages, UpstreamMessage{
+				Role:    msg.Role,
+				Content: content,
+			})
+		case []interface{}:
+			// Handle multimodal message
+			var textContent string
+			var upstreamFiles []UpstreamFile
+			for _, part := range content {
+				partMap, ok := part.(map[string]interface{})
+				if !ok {
+					return nil, fmt.Errorf("invalid content part format")
+				}
+
+				partType, _ := partMap["type"].(string)
+				switch partType {
+				case "text":
+					textContent, _ = partMap["text"].(string)
+				case "image_url":
+					imageUrlMap, _ := partMap["image_url"].(map[string]interface{})
+					dataUrl, _ := imageUrlMap["url"].(string)
+
+					// 1. Parse the data URL
+					header, base64Data, found := strings.Cut(dataUrl, ",")
+					if !found {
+						return nil, fmt.Errorf("invalid data url format: no comma separator")
+					}
+
+					// 2. Decode base64 to get size
+					decodedData, err := base64.StdEncoding.DecodeString(base64Data)
+					if err != nil {
+						return nil, fmt.Errorf("failed to decode base64 image: %v", err)
+					}
+					imageSize := len(decodedData)
+
+					// 3. Extract media type
+					mediaType := "image/png" // Default
+					if strings.HasPrefix(header, "data:") && strings.Contains(header, ";base64") {
+						mediaType = strings.TrimSuffix(strings.TrimPrefix(header, "data:"), ";base64")
+					}
+
+					fileName := "pasted_image.png" // Default filename
+
+					// 4. Populate the new, more complex struct
+					upstreamFiles = append(upstreamFiles, UpstreamFile{
+						Type:   "image",
+						Name:   fileName,
+						Size:   imageSize,
+						Status: "pasted",
+						File: UpstreamFileInner{
+							Filename: fileName,
+							Meta: UpstreamFileMeta{
+								Name:        fileName,
+								ContentType: mediaType,
+								Size:        imageSize,
+								Data:        base64Data, // This is our best guess
+							},
+						},
+					})
+				}
+			}
+			upstreamMessages = append(upstreamMessages, UpstreamMessage{
+				Role:    msg.Role,
+				Content: textContent,
+				Files:   upstreamFiles,
+			})
+		default:
+			return nil, fmt.Errorf("unsupported message content type: %T", msg.Content)
+		}
+	}
+	return upstreamMessages, nil
+}
+
 func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	setCORSHeaders(w)
 	if r.Method == "OPTIONS" {
@@ -346,6 +462,14 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	debugLog("请求解析成功 - display_model: %s, upstream_model: %s, 流式: %v, 消息数: %d", req.Model, upstreamModelID, req.Stream, len(req.Messages))
 
+	// Translate messages from OpenAI format to Upstream format
+	upstreamMessages, err := translateMessages(req.Messages)
+	if err != nil {
+		debugLog("消息翻译失败: %v", err)
+		http.Error(w, fmt.Sprintf("Failed to translate messages: %v", err), http.StatusBadRequest)
+		return
+	}
+
 	// 生成会话相关ID
 	chatID := fmt.Sprintf("%d-%d", time.Now().UnixNano(), time.Now().Unix())
 	msgID := fmt.Sprintf("%d", time.Now().UnixNano())
@@ -356,7 +480,7 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		ChatID:   chatID,
 		ID:       msgID,
 		Model:    upstreamModelID,
-		Messages: req.Messages,
+		Messages: upstreamMessages,
 		Params:   map[string]interface{}{},
 		Features: map[string]interface{}{
 			"enable_thinking": true,
