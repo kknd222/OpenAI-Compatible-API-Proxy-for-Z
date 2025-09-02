@@ -276,6 +276,11 @@ func callUpstream(upstreamReq UpstreamRequest, refererChatID string, authToken s
 	req.Header.Set("User-Agent", BROWSER_UA)
 	req.Header.Set("Origin", ORIGIN_BASE)
 	req.Header.Set("Referer", ORIGIN_BASE+"/c/"+refererChatID)
+	req.Header.Set("X-FE-Version", X_FE_VERSION)
+	req.Header.Set("sec-ch-ua", SEC_CH_UA)
+	req.Header.Set("sec-ch-ua-mobile", SEC_CH_UA_MOB)
+	req.Header.Set("sec-ch-ua-platform", SEC_CH_UA_PLAT)
+	req.Header.Set("Accept-Language", "zh-CN")
 
 	client := &http.Client{Timeout: 60 * time.Second}
 	return client.Do(req)
